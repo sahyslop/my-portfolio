@@ -1,22 +1,183 @@
 ---
-title: "Welcome to My Blog"
-date: "2025-01-28"
-excerpt: "An introduction to my new personal blog and what I plan to write about."
+title: "Python Vulnerability Scanner"
+date: "2025-02-06"
+excerpt: "This project scans a requirements.txt file and queries the OSV.dev database via an API"
 ---
 
-Hello and welcome to my blog! This is where I'll be sharing my thoughts, experiences, and learnings.
+# Building a Python Dependency Vulnerability Scanner
 
-## What to Expect
+## Overview
 
-I plan to write about a variety of topics including:
+This project is a command-line tool that scans Python `requirements.txt` files for known security vulnerabilities. It queries the OSV.dev database—a free, open vulnerability database aggregating data from sources like the GitHub Advisory Database, PyPI, and NVD—and reports CVEs affecting your pinned dependencies.
 
-- Technology and software development
-- Projects I'm working on
-- Things I'm learning
-- Occasional personal reflections
+The scanner also also remediates issues with a flag, it rewrites your requirements file to use the minimum safe versions that patch all detected vulnerabilities.
 
-## Stay Tuned
+## Motivation
+I wanted to create a tool to fight against python package attacks. 
+This tool provides: 
+1. Full control over the scanning logic and output format
+2. Understanding of how vulnerability databases work under the hood
+3. A lightweight tool with no external dependencies beyond `requests` and `packaging`
 
-This is just the beginning. I'm excited to share more content with you soon. Feel free to check back regularly or reach out if you'd like to connect.
+## Architecture
 
-Thanks for reading!
+The scanner is split into five modules with clear responsibilities:
+
+```
+┌─────────────────┐
+│   scanner.py    │  CLI, orchestration, report formatting
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    │         │
+┌───┴───┐ ┌───┴───┐
+│parser │ │ osv   │  Parse requirements / Query OSV API
+└───┬───┘ └───┬───┘
+    │         │
+    └────┬────┘
+         │
+    ┌────┴────┐
+    │ models  │  Shared dataclasses
+    └────┬────┘
+         │
+    ┌────┴────┐
+    │ fixer   │  Determine safe versions, rewrite file
+    └─────────┘
+```
+
+### Module Breakdown
+
+**models.py** — Defines three dataclasses:
+- `Requirement`: A parsed dependency (name, version, line number)
+- `Vulnerability`: A single CVE/GHSA with severity, CVSS score, and fix version
+- `ScanResult`: Links a requirement to its list of vulnerabilities
+
+**requirements_parser.py** — Parses `requirements.txt` using regex. Handles:
+- Pinned dependencies (`package==1.2.3`)
+- Extras (`package[extra]==1.2.3`)
+- Environment markers (`package==1.2.3; python_version >= "3.8"`)
+- Skips VCS URLs, editable installs, and unpinned dependencies with warnings
+
+
+**osv_client.py** — Interfaces with the OSV.dev API:
+- Uses the batch endpoint (`/v1/querybatch`) to check all packages in a single request
+- Fetches full vulnerability details (`/v1/vulns/{id}`) for each hit
+- Implements exponential backoff retry for rate limits and server errors
+- Extracts severity from multiple possible locations in the OSV schema (database_specific, severity array, affected entries)
+
+**fixer.py** — Remediation logic:
+- Collects all `fixed` versions across a package's vulnerabilities
+- Returns the highest fixed version (using PEP 440 version comparison)
+- Rewrites the requirements file in-place, preserving comments and line endings
+
+**scanner.py** — The CLI entrypoint:
+- Parses arguments (`-f FILE`, `--fix`)
+- Orchestrates the scan pipeline
+- Formats output as an ASCII table
+- Returns exit code 1 if vulnerabilities found (useful for CI)
+
+## Key Implementation Details
+
+### Batch Querying
+
+OSV.dev's batch endpoint accepts multiple packages in one request, excessive API calls:
+
+```python
+queries = [
+    {"version": "2.0.0", "package": {"name": "flask", "ecosystem": "PyPI"}},
+    {"version": "3.2.0", "package": {"name": "django", "ecosystem": "PyPI"}},
+    # ...
+]
+response = requests.post("https://api.osv.dev/v1/querybatch", json={"queries": queries})
+```
+
+The batch response only contains vulnerability IDs, so a second round of requests fetches full details (severity, fix versions, aliases).
+
+### Severity Extraction
+
+OSV vulnerability records store severity in inconsistent locations depending on the data source. The scanner checks multiple places:
+
+1. `database_specific.severity` — Direct severity label
+2. `severity[].score` — CVSS score (converted to label)
+3. `affected[].database_specific.severity` — Per-ecosystem severity
+
+This ensures broad compatibility across GHSA, CVE, and PyPI advisories.
+
+### Version Comparison
+
+The `packaging` library handles PEP 440 version parsing and comparison. When multiple vulnerabilities affect a package with different fix versions, the scanner picks the highest:
+
+```python
+from packaging.version import Version
+safe_version = max(fixed_versions, key=lambda v: Version(v))
+```
+
+### Safe File Rewriting
+
+The fixer preserves the original file structure:
+- Comments and blank lines pass through unchanged
+- Line endings (LF vs CRLF) are preserved
+- Extras and environment markers are retained
+- Only the version specifier is updated
+
+## Example Session
+
+```
+$ python scanner.py -f test_requirements.txt
+
+Scanning test_requirements.txt...
+Found 8 pinned packages. Querying OSV.dev...
+Fetching details for 25 unique vulnerabilities...
+
+PACKAGE                   VERSION      VULN ID              SEVERITY   FIXED IN
+---------------------------------------------------------------------------------
+flask                     2.0.0        GHSA-m2qf-hxjv-5gpq  HIGH       2.3.2
+django                    3.2.0        CVE-2023-36053       HIGH       3.2.20
+django                    3.2.0        CVE-2023-41164       MEDIUM     3.2.21
+urllib3                   1.26.4       CVE-2023-43804       HIGH       1.26.17
+werkzeug                  2.0.0        CVE-2023-46136       HIGH       2.3.8
+pillow                    9.0.0        CVE-2023-44271       HIGH       10.0.0
+cryptography              41.0.0       CVE-2023-49083       HIGH       41.0.6
+setuptools                65.0.0       CVE-2024-6345        HIGH       70.0.0
+
+Found 25 vulnerabilities in 7 packages.
+
+$ python scanner.py -f test_requirements.txt --fix
+
+...
+
+Updated 7 packages in test_requirements.txt:
+  cryptography -> 41.0.6
+  django -> 3.2.21
+  flask -> 2.3.2
+  pillow -> 10.0.0
+  setuptools -> 70.0.0
+  urllib3 -> 1.26.17
+  werkzeug -> 2.3.8
+```
+
+## CI Integration
+
+The scanner returns exit code 1 when vulnerabilities are found, making it easy to integrate into CI pipelines:
+
+
+## Limitations
+
+- Only scans pinned dependencies (`==`). Unpinned or range-based specifiers are skipped.
+- Does not resolve transitive dependencies. Use `pip freeze` to generate a fully pinned file first.
+- Fix versions are the minimum safe version, not necessarily the latest. Manual review recommended.
+- Rate limited by OSV.dev API (handled with retry/backoff, but large scans may be slow).
+
+## Future Improvements
+
+- JSON/SARIF output for integration with security dashboards
+- Transitive dependency resolution via `pip` or `pip-tools`
+- Caching of vulnerability data to reduce API calls
+- Support for `pyproject.toml` and Poetry lockfiles
+- CVSS vector parsing for more accurate severity scores
+
+## Conclusion
+
+This project demonstrates how to build a practical security tool by composing simple components: a parser, an API client, and a file rewriter. The modular design makes it easy to extend—swap in a different vulnerability database, add new output formats, or integrate with package managers beyond pip.
+
+The full source is available at: https://github.com/sahyslop/vulnerability-scanner
